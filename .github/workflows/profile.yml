@@ -1,0 +1,95 @@
+name: Profile
+
+# One nightly job for both profiles: counts commits on GitHub and GitLab, renders the 3D chart,
+# publishes this repository and copies it to the GitLab profile (scripts/sync_gitlab.sh).
+on:
+  schedule:
+    - cron: '17 23 * * *' # 04:17 Tashkent
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-profile
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.repository == 'mehroj-x/mehroj-x'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Whether GitLab is set up; the token itself is only given to the steps that need it.
+      HAS_GITLAB: ${{ secrets.GITLAB_TOKEN != '' }}
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # Full history, so publish_single_commit.sh can tell whether it is already one commit.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Run tests
+        run: python3 -m unittest discover -s tests
+
+      # USER_TOKEN (classic PAT: read:user, repo) adds private GitHub repositories.
+      # GITLAB_TOKEN (read_api, write_repository) adds every GitLab project you are a member of;
+      # COMMIT_EMAILS (your commit emails, space separated) tells your GitLab commits apart.
+      # Commits already in data/commit-habits.json keep counting even when a repository is no
+      # longer readable. The script prints counts only, never repository names: these logs are public.
+      - name: Count commits on GitHub and GitLab
+        env:
+          GITHUB_TOKEN: ${{ secrets.USER_TOKEN || github.token }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          COMMIT_EMAILS: ${{ secrets.COMMIT_EMAILS }}
+        run: |
+          args=()
+          if [ "$HAS_GITLAB" = true ]; then
+            args+=(--gitlab)
+          else
+            echo "::warning::GITLAB_TOKEN is not set: GitLab commits are not counted and the GitLab profile is not updated."
+          fi
+          python3 scripts/commit_habits.py --username mehroj-x --timezone Asia/Tashkent "${args[@]}"
+
+      # The chart is drawn from the same commit data as the README (both sites, plus the old
+      # account's archive), with the live account's GitHub-only activity added.
+      - name: Start contribution proxy
+        env:
+          GITHUB_TOKEN: ${{ secrets.USER_TOKEN || github.token }}
+        run: |
+          nohup python3 scripts/contrib_proxy.py --combine --port 8787 --timezone Asia/Tashkent > /dev/null 2>&1 &
+          for _ in {1..20}; do
+            curl -fsS http://127.0.0.1:8787/health > /dev/null && exit 0
+            sleep 1
+          done
+          exit 1
+
+      - name: Render 3D contribution chart
+        uses: yoshi389111/github-profile-3d-contrib@7d95e7d4cdc028dd1e1cbd957d65f35efb12ae39 # v0.9.3
+        env:
+          GITHUB_TOKEN: local-proxy
+          GITHUB_ENDPOINT: http://127.0.0.1:8787/graphql
+          USERNAME: ${{ github.repository_owner }}
+          SETTING_JSON: data/profile-3d-contrib.json
+
+      - name: Publish as the repository's only commit
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- README.md data images profile-3d-contrib
+          bash scripts/publish_single_commit.sh "$DEFAULT_BRANCH"
+
+      - name: Copy to the GitLab profile
+        if: env.HAS_GITLAB == 'true'
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: bash scripts/sync_gitlab.sh
